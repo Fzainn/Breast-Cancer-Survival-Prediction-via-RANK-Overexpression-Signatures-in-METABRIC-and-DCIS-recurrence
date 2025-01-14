@@ -1,0 +1,373 @@
+---
+title: "RANK overexpression in BC"
+output: html_document
+date: "2025-01-06"
+---
+
+```{r Data filtration and classification based ob logcf&adj.p.value(RANK overexpression dataset)}
+
+#change working directory
+setwd("C:\\Users\\DELL\\Downloads")
+
+#load the required packages 
+install.packages("readxl")
+install.packages("survival")
+install.packages("survminer")
+BiocManager::install("biomaRt")
+BiocManager::install("org.Hs.eg.db")
+library(biomaRt)
+library(org.Hs.eg.db)
+library(survival)
+library(survminer)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(gridExtra)
+
+
+
+#reading the file, skip the first two header rows
+mmc2 <- read_excel("mmc2.xlsx", skip = 2)
+
+#colnames(mmc2)
+#str(mmc2)
+
+
+#convert logfc & adj.p.val to numeric values as R treated it as chr
+mmc2[c("adj.P.Val", "logFC", "P.Value")] <- lapply(mmc2[c("adj.P.Val", "logFC", "P.Value")], as.numeric)
+#remove null values
+mmc2 <- mmc2[!is.na(mmc2$adj.P.Val) & !is.na(mmc2$logFC) & !is.na(mmc2$P.Value), ]
+
+
+#str(mmc2)
+
+
+
+#filter  Differentially expressed genes between WT luminal and Rank +/tg luminal MECS (MMC2 table) to remove noise and focus on biologically meaningful changes
+filtered_data <- subset(mmc2, adj.P.Val < 0.05 & abs(logFC) > 1)
+
+# Convert gene symbols in the RANK expression data to uppercase for consistency
+filtered_data$Geneid <- toupper(filtered_data$Geneid)
+
+
+
+#Classify up and down regulated genes, based on LogFC. by creating a new column in the table called 'regulation' and make a conditional statement, if logfc > 0, returns true "upregulated' if not 'downregulated'
+filtered_data$regulation <- ifelse(
+  filtered_data$logFC > 0, "Upregulated", "Downregulated"
+)
+
+#str(filtered_data)
+
+#volcano plot
+ggplot(filtered_data, aes(x = logFC, y = -log10(P.Value), color = regulation)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Downregulated" = "blue", "Upregulated" = "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot of Differential Gene Expression",
+    x = "Log2 Fold Change (logFC)",
+    y = "-Log10 P-Value"
+  )
+
+#bar plot
+regulation_counts <- table(filtered_data$regulation)
+barplot(regulation_counts, 
+        main = "Number of Upregulated vs Downregulated Genes",
+        col = c("red", "blue"),
+        names.arg = c("Downregulated", "Upregulated"),
+        ylab = "Number of Genes",
+        xlab = "Regulation")
+
+
+```
+
+```{r load and prepare METABRIC data (expression and clinical) }
+
+# Load the METABRIC gene expression data
+METBgene_expression <- read.table("data\\data_mrna_illumina_microarray.txt", header = TRUE)
+
+
+
+# Check for duplicate rows, if there are duplicates, that is mean two genes are identical and need to be removed
+duplicate_rows <- METBgene_expression[duplicated(METBgene_expression), ]
+if (nrow(duplicate_rows) > 0) {
+  print("Duplicate rows found and removed.")
+  METBgene_expression <- METBgene_expression %>%
+    distinct()
+} else {
+  print("No duplicate rows found.")
+}
+
+# Print duplicate gene symbols (if any, aggregate them as they are duplicate gene symbol with differential expression values)
+# Aggregate duplicate gene symbols by taking the mean expression value
+duplicate_genes <- METBgene_expression$Hugo_Symbol[duplicated(METBgene_expression$Hugo_Symbol)]
+if (length(duplicate_genes) > 0) {
+  print("Duplicate gene symbols found. Aggregating data...")
+  METBgene_expression <- METBgene_expression %>%
+    group_by(Hugo_Symbol) %>%
+    summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+} else {
+  print("No duplicate gene symbols found.")
+}
+
+
+
+# Remove genes with NA values
+METBgene_expression <- METBgene_expression[complete.cases(METBgene_expression), ]
+
+
+
+#extract geneid 
+rank_genes <- filtered_data[[1]]
+
+#check for the missing genes
+missing_genes <- setdiff(rank_genes, METBgene_expression$Hugo_Symbol)
+print("Missing genes:")
+print(missing_genes)
+
+
+# Remove 'SLFN9' from rank_genes
+rank_genes <- rank_genes[rank_genes != "SLFN9"]
+
+
+# Filter METBgene_expression to include only RANK signature genes
+filtered_metabric <- METBgene_expression %>%
+  filter(Hugo_Symbol %in% rank_genes)
+
+# Check the filtered data
+head(filtered_metabric)
+dim(filtered_metabric)
+
+
+
+
+
+
+
+
+# Load the METABRIC clinical data
+METBclinical_data <- read.table("data\\data_clinical_patient.txt", header = TRUE, sep = "\t")
+
+# Replace hyphens with dots in METBclinical_data
+METBclinical_data <- METBclinical_data %>%
+  mutate(PATIENT_ID = gsub("-", ".", PATIENT_ID))
+
+
+# View the first few rows of the clinical data
+#head(METBclinical_data)
+
+# Exclude Hugo_Symbol and Entrez_Gene_Id as they not expression values
+expression_data <- filtered_metabric[, -c(1, 2)]
+
+# Transpose the data: convert the data from genes as rows and samples as columns to samples as rows and genes as columns
+filtered_metabric_transposed <- as.data.frame(t(expression_data))
+
+# Set gene names as column names
+colnames(filtered_metabric_transposed) <- filtered_metabric$Hugo_Symbol
+
+# Add PATIENT_ID column
+filtered_metabric_transposed$PATIENT_ID <- rownames(filtered_metabric_transposed)
+
+
+# Merge with clinical data
+merged_data <- merge(filtered_metabric_transposed, METBclinical_data, by = "PATIENT_ID")
+
+
+
+
+############################ SURVIVAL ANALYSIS ###########################
+
+# Extract relevant columns
+survival_data <- merged_data %>%
+  select(PATIENT_ID, OS_MONTHS, OS_STATUS, AGE_AT_DIAGNOSIS,ER_IHC, ASIC2, SPP1, LALBA, CSN3, CLIC6, BTN1A1, TPH1, RASGRF1, CXCL17, ST3GAL1, HP, TM4SF1, HEG1, TGM2, FOSB, CNTN1, ATP6V1C2, TYMS, ATAD2, ABCC4, LTF)
+
+
+#Convert OS_STATUS to a binary variable (1 = event occurred, 0 = censored)
+survival_data <- survival_data %>%
+   mutate(Event_Status = ifelse(OS_STATUS == "1:DECEASED", 1, 0))
+
+
+# Check for missing values
+sum(is.na(survival_data$OS_MONTHS))
+sum(is.na(survival_data$Event_Status))
+sum(is.na(survival_data$AGE_AT_DIAGNOSIS))
+sum(is.na(survival_data$ER_IHC))  
+
+
+# Create a survival object
+survival_object <- Surv(time = survival_data$OS_MONTHS, event = survival_data$Event_Status)
+
+
+
+
+######## Perform Univariate Cox Regression: identify significant predictors of survival #########
+
+#For each gene signature (or variable of interest), perform univariate Cox regression to assess its individual prognostic value.
+
+# Initialize an empty list to store results
+cox_results <- list()
+
+# Loop through each gene signature
+genes <- colnames(survival_data)[6:(ncol(survival_data) - 1)]  # Exclude first 5 and last column
+for (gene in genes) {
+  formula <- as.formula(paste("survival_object ~", gene, "+ AGE_AT_DIAGNOSIS + ER_IHC"))  # Include covariates (predictor variables)
+  cox_model <- coxph(formula, data = survival_data)
+  cox_results[[gene]] <- summary(cox_model)
+}
+
+
+
+# Initialize a data frame to store significant results
+significant_results <- data.frame(Gene = character(), HR = numeric(), CI_lower = numeric(), CI_upper = numeric(), P_value = numeric())
+
+
+# Loop through each gene in cox_results
+for (gene in genes) {
+  cox_summary <- cox_results[[gene]]
+  
+  # Extract hazard ratio (HR), confidence intervals (CI), and p-value
+  hr <- cox_summary$coefficients[1, "exp(coef)"]  # Hazard ratio for the gene
+  ci_lower <- cox_summary$conf.int[1, "lower .95"]  # Lower 95% CI
+  ci_upper <- cox_summary$conf.int[1, "upper .95"]  # Upper 95% CI
+  p_value <- cox_summary$coefficients[1, "Pr(>|z|)"]  # P-value
+  
+  # Store significant results (e.g., p-value < 0.05)
+  if (p_value < 0.05) {
+    significant_results <- rbind(significant_results, data.frame(Gene = gene, HR = hr, CI_lower = ci_lower, CI_upper = ci_upper, P_value = p_value))
+  }
+}
+
+# Print significant results
+print(significant_results)
+
+
+#Apply Benjamini-Hochberg FDR correction
+significant_results$P_adj <- p.adjust(significant_results$P_value, method = "BH")
+print(significant_results)
+
+
+
+# Filter results based on adjusted p-value (e.g., P_adj < 0.05)
+significant_results <- significant_results[significant_results$P_adj < 0.05, ]
+print(significant_results)
+
+
+
+################## Kaplan-Meier curve:visualize survival differences ##################
+
+
+
+# Step 1: Defines a function to fit a survival model and generate Kaplan-Meier plots 
+#Loops through significant genes, creates Kaplan-Meier plots, and saves results.
+fit_survival_model <- function(data, group_col, time_col = "OS_MONTHS", event_col = "Event_Status") {
+  formula <- as.formula(paste("Surv(", time_col, ",", event_col, ") ~", group_col))
+  fit <- survfit(formula, data = data)
+  fit$call$formula <- formula
+  fit$call$data <- data
+  logrank_test <- survdiff(formula, data = data)
+  p_value <- 1 - pchisq(logrank_test$chisq, df = 1)
+  cox_fit <- coxph(formula, data = data)
+  hazard_ratio <- summary(cox_fit)$coefficients[2]
+  effect_direction <- ifelse(hazard_ratio > 1, "High = Worse Survival", "High = Better Survival")
+  plot <- ggsurvplot(
+    fit, 
+    data = data, 
+    pval = TRUE, 
+    risk.table = TRUE, 
+    title = paste("Survival for", group_col)
+  )
+  return(list(
+    fit = fit,
+    p_value = p_value,
+    hazard_ratio = hazard_ratio,
+    effect_direction = effect_direction,
+    plot = plot
+  ))
+}
+
+# Step 2: Initialize results summary
+results_summary <- data.frame(
+  Gene = character(),
+  p_value = numeric(),
+  Hazard_Ratio = numeric(),
+  Effect_Direction = character(),
+  stringsAsFactors = FALSE
+)
+
+
+# Create a list to store plots
+plot_list <- list()
+
+# Step 3: Loop through each gene
+for (gene in significant_results$Gene) {
+  # Create a unique group column for each gene
+  group_col <- paste0("group_", gene)
+  survival_data[[group_col]] <- ifelse(survival_data[[gene]] > median(survival_data[[gene]], na.rm = TRUE), "High", "Low")
+  
+  # Fit survival model and extract results using the function
+  results <- fit_survival_model(survival_data, group_col, "OS_MONTHS", "Event_Status")
+  
+  # Save the Kaplan-Meier plot using ggsave (optional: save individual plots)
+  ggsave(filename = paste0("plot_", gene, ".pdf"), plot = results$plot$plot, width = 10, height = 8)
+  
+  # Add the plot to the list for combining into a single PDF
+  plot_list[[gene]] <- results$plot$plot
+  
+  # Add results to the summary table
+  results_summary <- rbind(results_summary, data.frame(
+    Gene = gene,
+    p_value = results$p_value,
+    Hazard_Ratio = results$hazard_ratio,
+    Effect_Direction = results$effect_direction
+  ))
+  
+  # Save checkpoint results
+  save(results_summary, file = "checkpoint_results_summary.RData")
+  
+  # Print progress
+  cat("Processed gene:", gene, "\n")
+}
+
+
+
+# Step 4: Calculate the signature score (average z-score )
+#A signature score reduces the dimensionality of the data by summarizing the expression of multiple genes into a single value.
+signature_genes <- significant_results$Gene
+survival_data$signature_score <- rowMeans(scale(survival_data[, signature_genes]))
+
+# Step 5: Create a binary group based on the signature score
+survival_data$group <- ifelse(survival_data$signature_score > median(survival_data$signature_score, na.rm = TRUE), "High", "Low")
+
+# Step 6: Fit survival model for the signature score
+results <- fit_survival_model(survival_data, "group", "OS_MONTHS", "Event_Status")
+
+# Step 7: Add signature score results to the summary table
+results_summary <- rbind(results_summary, data.frame(
+  Gene = "RANK Signature Score",
+  p_value = results$p_value,
+  Hazard_Ratio = results$hazard_ratio,
+  Effect_Direction = results$effect_direction
+))
+
+
+# Step 8: Print the summary table
+print(results_summary)
+
+# Step 9: Save the summary table as a CSV file
+write.csv(results_summary, file = "RANK_Signature_Survival_Results.csv", row.names = FALSE)
+
+# Step 10: Add the signature score plot to the list for combining into a single PDF
+plot_list[["signature_score"]] <- results$plot$plot
+
+# Step 11: Combine all plots into a single PDF
+ggsave(filename = "Myplots.pdf", plot = marrangeGrob(grobs = plot_list, nrow = 1, ncol = 1), width = 10, height = 8)
+
+
+# Print completion message
+cat("All plots saved successfully in Myplots.pdf.\n")
+
+
+###########################################################################
+
+```
