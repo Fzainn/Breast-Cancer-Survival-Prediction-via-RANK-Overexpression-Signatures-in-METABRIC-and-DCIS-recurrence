@@ -1,0 +1,345 @@
+---
+title: "RANK wITH DCIS"
+output: html_document
+date: "2025-01-6"
+---
+
+```{r DCIS recurrence}
+
+#load required packages
+library(biomaRt)
+library(org.Hs.eg.db)
+library(survival)
+library(survminer)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(gridExtra)
+
+
+
+#load DICS, expression data 
+DCIS <- read.csv("RAHBT_LCM_reads_matrix_Epi265_Str196_VSTnorm.csv")
+head(DCIS)
+
+
+RANK <- read.csv("filtered_data.csv")
+
+
+
+# Check for duplicate rows, if there are duplicates, that is mean two genes are identical and need to be removed
+duplicate_rows <- DCIS[duplicated(DCIS), ]
+if (nrow(duplicate_rows) > 0) {
+  print("Duplicate rows found and removed.")
+  DCIS <- DCIS %>%
+    distinct()
+} else {
+  print("No duplicate rows found.")
+}
+
+# Print duplicate gene symbols (if any, aggregate them as they are duplicate gene symbol with differential expression values)
+# Aggregate duplicate gene symbols by taking the mean expression value
+duplicate_genes <- DCIS$X[duplicated(DCIS$X)]
+if (length(duplicate_genes) > 0) {
+  print("Duplicate gene symbols found. Aggregating data...")
+  DCIS <- DCIS %>%
+    group_by(X) %>%
+    summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+} else {
+  print("No duplicate gene symbols found.")
+}
+
+# Remove genes with NA values
+DCIS <- DCIS[complete.cases(DCIS), ]
+
+#extract geneid 
+rank_genes <- RANK[[1]]
+
+#check for the missing genes
+missing_genes <- setdiff(rank_genes, DCIS$X)
+print("Missing genes:")
+print(missing_genes)
+
+
+# Remove 'SLFN9' from rank_genes
+rank_genes <- rank_genes[rank_genes != "SLFN9"]
+
+
+# Filter METBgene_expression to include only RANK signature genes
+filtered_DCIS <- DCIS %>%
+  filter(X %in% rank_genes)
+
+
+# Check the filtered data
+head(filtered_DCIS)
+dim(filtered_DCIS)
+
+
+# Extract all column names from the expression data
+expression_ids <- colnames(filtered_DCIS)[-1]
+
+
+# View the first few column names
+head(expression_ids)
+
+# Extract base IDs by removing the last suffix
+patient_ids <- sub("_[^_]+$", "", expression_ids)
+
+# View the first few base IDs
+head(patient_ids)
+
+
+# Exclude X column as is not expression values
+expression_data <- filtered_DCIS[, -c(1)]
+
+
+
+# Transpose the expression data to have samples as rows
+expression_data_transposed <- as.data.frame(t(expression_data))
+
+
+
+# Set gene names as column names
+colnames(expression_data_transposed) <- filtered_DCIS$X
+
+
+
+dim(expression_data_transposed)
+
+
+
+# Set gene names as column names
+expression_data_transposed$Patient_ID <- patient_ids
+
+
+# View the first few rows
+head(expression_data_transposed)
+
+
+
+
+#######load DCIS clinical data########
+DCISClinical <- read.table("DCISClinical.tsv", header = TRUE, sep = "\t")
+
+#change first column name
+colnames(DCISClinical)[1] <- "Patient_ID"
+
+#Merge clinical data with DCIS expression data
+merged_data <- merge(expression_data_transposed, DCISClinical, by = "Patient_ID")
+
+
+
+################################ SURVIVAL ANALYSIS ######################################
+
+# Extract relevant columns
+survival_data <- merged_data %>%
+  select(Patient_ID, Age.at.Diagnosis..years., Progression.or.Recurrence, Days.to.Last.Known.Disease.Status, ASIC2, SPP1, LALBA, CSN3, CLIC6, BTN1A1, TPH1, RASGRF1, CXCL17, ST3GAL1, HP, TM4SF1, HEG1, TGM2, FOSB, CNTN1, ATP6V1C2, TYMS, ATAD2, ABCC4, LTF)
+
+
+# Convert Progression.or.Recurrence to binary (1 = recurrence, 0 = no recurrence)
+survival_data$Event <- ifelse(survival_data$Progression.or.Recurrence == "Yes - Progression or Recurrence", 1, 0)
+
+
+# Check for missing values
+sum(is.na(survival_data$Age.at.Diagnosis..years))
+sum(is.na(survival_data$Progression.or.Recurrence))
+sum(is.na(survival_data$Days.to.Last.Known.Disease.Status))
+sum(is.na(survival_data$Event)) 
+
+# Create a survival object
+survival_object <- Surv(
+  time = survival_data$Days.to.Last.Known.Disease.Status,  # Time to event
+  event = survival_data$Event                              # Event status (1 = recurrence, 0 = censored)
+)
+
+# View the survival object
+head(survival_object)
+
+######## Perform Univariate Cox Regression: identify significant predictors of survival #########
+
+#For each gene signature (or variable of interest), perform univariate Cox regression to assess its individual prognostic value.
+
+# Initialize an empty list to store results
+cox_results <- list()
+
+
+# Define the list of genes (RANK signature genes)
+genes <- c("ATP6V1C2", "LTF", "HEG1", "TM4SF1", "CSN3", "SPP1", "BTN1A1", "ATAD2", "ST3GAL1", "TPH1", "CNTN1", "LALBA", "ABCC4", "RASGRF1", "HP", "ASIC2", "TYMS", "CXCL17", "FOSB", "TGM2", "CLIC6")
+
+# Loop through each gene signature
+for (gene in genes) {
+  # Define the formula for the Cox model
+  formula <- as.formula(paste("survival_object ~", gene, "+ Age.at.Diagnosis..years."))  
+  
+  # Fit the Cox model
+  cox_model <- coxph(formula, data = survival_data)
+  
+  # Store the results
+  cox_results[[gene]] <- summary(cox_model)
+}
+
+
+# Initialize a data frame to store significant results
+significant_results <- data.frame(Gene = character(), HR = numeric(), CI_lower = numeric(), CI_upper = numeric(), P_value = numeric())
+
+
+# Loop through each gene in cox_results
+for (gene in genes) {
+  cox_summary <- cox_results[[gene]]
+  hr <- cox_summary$coefficients[1, "exp(coef)"]  # Hazard ratio
+  ci_lower <- cox_summary$conf.int[1, "lower .95"]  # Lower 95% CI
+  ci_upper <- cox_summary$conf.int[1, "upper .95"]  # Upper 95% CI
+  p_value <- cox_summary$coefficients[1, "Pr(>|z|)"]  # P-value
+  
+  if (p_value < 0.05) {
+    significant_results <- rbind(significant_results, data.frame(Gene = gene, HR = hr, CI_lower = ci_lower, CI_upper = ci_upper, P_value = p_value))
+  }
+}
+
+
+
+
+
+
+
+
+# Apply Benjamini-Hochberg FDR correction
+significant_results$P_adj <- p.adjust(significant_results$P_value, method = "BH")
+
+# Filter results based on adjusted p-value (e.g., P_adj < 0.05)
+significant_results <- significant_results[significant_results$P_adj < 0.05, ]
+
+# Print significant results
+print(significant_results)
+
+
+
+################## Kaplan-Meier curve:visualize survival differences ##################
+
+# Define a function to fit a survival model and generate Kaplan-Meier plots
+fit_survival_model <- function(data, group_col, time_col = "Days.to.Last.Known.Disease.Status", event_col = "Event") {
+  # Construct the formula as a string and convert it to a formula object
+  formula <- as.formula(paste("Surv(", time_col, ",", event_col, ") ~", group_col))
+  
+  # Fit the Kaplan-Meier model
+  fit <- survfit(formula, data = data)
+  fit$call$formula <- formula
+  fit$call$data <- data
+  
+  # Perform log-rank test
+  logrank_test <- survdiff(formula, data = data)
+  p_value <- 1 - pchisq(logrank_test$chisq, df = 1)
+  
+  # Fit Cox model to get hazard ratio
+  cox_fit <- coxph(formula, data = data)
+  hazard_ratio <- summary(cox_fit)$coefficients[2]
+  effect_direction <- ifelse(hazard_ratio > 1, "High = Worse Survival", "High = Better Survival")
+  
+  # Generate Kaplan-Meier plot
+  plot <- ggsurvplot(
+    fit, 
+    data = data, 
+    pval = TRUE,  
+    risk.table = TRUE, 
+    title = paste("Survival for", group_col)
+  )
+  
+  return(list(
+    fit = fit,
+    p_value = p_value,  
+    hazard_ratio = hazard_ratio,
+    effect_direction = effect_direction,
+    plot = plot
+  ))
+}
+
+
+
+# Initialize results summary
+results_summary2 <- data.frame(
+  Gene = character(),
+  p_value = numeric(),
+  Hazard_Ratio = numeric(),
+  Effect_Direction = character(),
+  stringsAsFactors = FALSE
+)
+
+# Create a list to store plots
+plot_list <- list()
+
+
+
+# Loop through each significant gene
+for (gene in significant_results$Gene) {
+  # Create a unique group column for each gene
+  group_col <- paste0("group_", gene)
+  survival_data[[group_col]] <- ifelse(survival_data[[gene]] > median(survival_data[[gene]], na.rm = TRUE), "High", "Low")
+  
+  # Fit survival model and extract results using the function
+  results <- fit_survival_model(survival_data, group_col, "Days.to.Last.Known.Disease.Status", "Event")
+  
+  # Save the Kaplan-Meier plot using ggsave (optional: save individual plots)
+  ggsave(filename = paste0("plot_", gene, ".pdf"), plot = results$plot$plot, width = 10, height = 8)
+  
+  # Add the plot to the list for combining into a single PDF
+  plot_list[[gene]] <- results$plot$plot
+  
+  # Add results to the summary table
+  results_summary2 <- rbind(results_summary2, data.frame(
+    Gene = gene,
+    p_value = results$p_value,  # Use the correct p-value (log-rank or Cox)
+    Hazard_Ratio = results$hazard_ratio,
+    Effect_Direction = results$effect_direction
+  ))
+  
+  
+  # Save checkpoint results
+  save(results_summary2, file = "checkpoint_results_summary2.RData")
+  
+  # Print progress
+  cat("Processed gene:", gene, "\n")
+}
+
+
+# Calculate the signature score (average z-score )
+#A signature score reduces the dimensionality of the data by summarizing the expression of multiple genes into a single value.
+signature_genes <- significant_results$Gene
+survival_data$signature_score <- rowMeans(scale(survival_data[, signature_genes]))
+
+#Create a binary group based on the signature score
+survival_data$group <- ifelse(survival_data$signature_score > median(survival_data$signature_score, na.rm = TRUE), "High", "Low")
+
+# Fit survival model for the signature score
+results <- fit_survival_model(survival_data, "group", "Days.to.Last.Known.Disease.Status", "Event")
+
+#Add signature score results to the summary table
+results_summary2 <- rbind(results_summary2, data.frame(
+  Gene = "RANK Signature Score",
+  p_value = results$p_value,
+  Hazard_Ratio = results$hazard_ratio,
+  Effect_Direction = results$effect_direction
+))
+
+
+
+
+# Print the summary table
+print(results_summary2)
+
+# Save the summary table as a CSV file
+write.csv(results_summary2, file = "RANK_Signature_Survival_Results2.csv", row.names = FALSE)
+
+# Add the signature score plot to the list for combining into a single PDF
+plot_list[["signature_score"]] <- results$plot$plot
+
+# Combine all plots into a single PDF
+ggsave(filename = "Myplots2.pdf", plot = marrangeGrob(grobs = plot_list, nrow = 1, ncol = 1), width = 10, height = 8)
+
+# Print completion message
+cat("All plots saved successfully in Myplots2.pdf.\n")
+
+##############################################################################
+
+
+```
